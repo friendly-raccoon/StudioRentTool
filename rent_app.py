@@ -216,17 +216,59 @@ if bank_file and tenant_file:
     # IN-MEMORY EXCEL EXPORT
     # ==========================
 
-    buffer = io.BytesIO()
+    import openpyxl
+from openpyxl.utils.dataframe import dataframe_to_rows
+from openpyxl.worksheet.dimensions import ColumnDimension
+from openpyxl.styles import Alignment
 
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        ledger.to_excel(writer, sheet_name="Ledger", index=False)
-        summary.to_excel(writer, sheet_name="Summary", index=False)
+# Prepare Excel writer
+buffer = io.BytesIO()
+with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
 
-    buffer.seek(0)
+    # 1️⃣ Write ledger as-is
+    ledger.to_excel(writer, sheet_name="Ledger", index=False)
 
-    st.download_button(
-        label="Download Excel Report",
-        data=buffer,
-        file_name="rent_report.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
+    # 2️⃣ Write summary sheet
+    summary.to_excel(writer, sheet_name="Summary", index=False)
+
+    # 3️⃣ Add grouped detailed payments per tenant in a new sheet
+    wb = writer.book
+    ws = wb.create_sheet("Details")
+
+    row_counter = 1
+    for tenant in summary["Artist Name"]:
+        tenant_ledger = ledger[ledger["Artist Name"] == tenant][[
+            "Studio", "Month", "Expected Rent", "Allocated", "Status", "Payment Dates"
+        ]]
+        # Tenant header row
+        ws.append([tenant])
+        start_row = row_counter + 1
+
+        for r in dataframe_to_rows(tenant_ledger, index=False, header=True):
+            ws.append(r)
+            row_counter += 1
+
+        end_row = row_counter
+        # Group rows under tenant header
+        for i in range(start_row, end_row + 1):
+            ws.row_dimensions[i].outlineLevel = 1
+            ws.row_dimensions[i].hidden = True
+
+        row_counter += 1  # blank row before next tenant
+
+    # Optional: auto-width and wrap for Payment Dates
+    for col in ws.columns:
+        max_length = max(len(str(cell.value)) if cell.value is not None else 0 for cell in col)
+        col_letter = col[0].column_letter
+        ws.column_dimensions[col_letter].width = min(max_length + 5, 50)
+        for cell in col:
+            cell.alignment = Alignment(wrap_text=True)
+
+buffer.seek(0)
+
+st.download_button(
+    label="Download Excel Report",
+    data=buffer,
+    file_name="rent_report.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+)
