@@ -1,231 +1,283 @@
 import streamlit as st
 import pandas as pd
-from rapidfuzz import process, fuzz
-import io
+from datetime import datetime
+from io import BytesIO
 
 st.set_page_config(page_title="Studio Rent Tool", layout="wide")
-MATCH_THRESHOLD = 85
 
-st.title("Studio Rent Accounting Tool")
-st.markdown(
-    "Upload bank CSV and tenant Excel file (wide format, one row per tenant, columns per month) "
-    "to generate rent ledger with payment dates and allocations.\n\n"
-    "Tenant sheet should have 'Studio', 'Studio Order', 'Artist Name', and monthly rent columns.\n\n"
-    "Bank CSV can optionally contain a 'Verwendungszweck' column."
-)
+st.title("Studio Rent Management Tool")
 
 # ==========================
 # FILE UPLOAD
 # ==========================
-bank_file = st.file_uploader("Upload bank CSV", type=["csv"])
-tenant_file = st.file_uploader("Upload tenant Excel file", type=["xlsx"])
+tenants_file = st.file_uploader("Upload Tenant Excel (wide format)", type=["xlsx"])
+bank_file = st.file_uploader("Upload Bank CSV", type=["csv"])
 
-if bank_file and tenant_file:
-    try:
-        bank = pd.read_csv(bank_file)
-        tenants_wide = pd.read_excel(tenant_file)
-    except Exception as e:
-        st.error(f"File reading error: {e}")
-        st.stop()
-
-    # Trim column names
-    bank.columns = bank.columns.str.strip()
-    tenants_wide.columns = tenants_wide.columns.str.strip()
+if tenants_file and bank_file:
 
     # ==========================
-    # CHECK COLUMNS
+    # LOAD TENANTS (WIDE FORMAT)
     # ==========================
-    required_bank_cols = {"Date", "Amount", "Name"}
-    required_tenant_base_cols = {"Studio", "Studio Order", "Artist Name"}
+    tenants_raw = pd.read_excel(tenants_file)
 
-    if not required_bank_cols.issubset(bank.columns):
-        st.error("Bank CSV must contain columns: Date, Amount, Name")
-        st.stop()
+    month_columns = [col for col in tenants_raw.columns if "-" in col]
 
-    if not required_tenant_base_cols.issubset(tenants_wide.columns):
-        st.error("Tenant sheet must contain columns: Studio, Studio Order, Artist Name, plus one column per month")
-        st.stop()
-
-    # Optional Verwendungszweck
-    verwendungs_col = "Verwendungszweck" if "Verwendungszweck" in bank.columns else None
-
-    # ==========================
-    # SORT TENANTS BY STUDIO AND STUDIO ORDER
-    # ==========================
-    tenants_wide = tenants_wide.sort_values(["Studio", "Studio Order"])
-
-    # ==========================
-    # CLEAN BANK DATA
-    # ==========================
-    bank["Date"] = pd.to_datetime(bank["Date"], errors="coerce")
-    bank = bank.dropna(subset=["Date"]).sort_values("Date")
-    bank["Amount"] = pd.to_numeric(bank["Amount"], errors="coerce")
-    bank = bank.dropna(subset=["Amount"])
-
-    tenant_names = tenants_wide["Artist Name"].tolist()
-
-    # ==========================
-    # MATCH NAMES
-    # ==========================
-    def match_name(name):
-        match, score, _ = process.extractOne(str(name), tenant_names, scorer=fuzz.token_sort_ratio)
-        return match if score >= MATCH_THRESHOLD else None
-
-    bank["Matched Name"] = bank["Name"].apply(match_name)
-    unmatched = bank[bank["Matched Name"].isna()]
-
-    if len(unmatched) > 0:
-        st.warning("Unmatched payments detected in the CSV:")
-
-    unmatched_display_cols = ["Date", "Name", "Amount"]
-    if verwendungs_col:
-        unmatched_display_cols.append(verwendungs_col)
-    st.dataframe(unmatched[unmatched_display_cols])
-
-    bank = bank.dropna(subset=["Matched Name"])
-    if bank.empty:
-        st.error("No valid matched payments found.")
-        st.stop()
-
-    # ==========================
-    # CONVERT TENANT SHEET TO LONG FORMAT
-    # ==========================
-    month_cols = [c for c in tenants_wide.columns if c not in ["Studio", "Studio Order", "Artist Name"]]
-
-    tenants_long = tenants_wide.melt(
+    tenants_long = tenants_raw.melt(
         id_vars=["Studio", "Studio Order", "Artist Name"],
-        value_vars=month_cols,
+        value_vars=month_columns,
         var_name="Month",
-        value_name="Expected Rent"
+        value_name="Rent Due"
     )
 
-    tenants_long['Month'] = pd.to_datetime(tenants_long['Month'], format="%b-%Y", errors='coerce')
-    tenants_long = tenants_long.dropna(subset=["Expected Rent", "Month"])
-    tenants_long["Expected Rent"] = pd.to_numeric(tenants_long["Expected Rent"], errors='coerce')
+    tenants_long["Rent Due"] = pd.to_numeric(tenants_long["Rent Due"], errors="coerce").fillna(0)
+    tenants_long["Month"] = pd.to_datetime(tenants_long["Month"], format="%b-%Y")
+
+    # ==========================
+    # LOAD BANK
+    # ==========================
+    bank = pd.read_csv(bank_file)
+    bank["Date"] = pd.to_datetime(bank["Date"])
+    bank["Amount"] = pd.to_numeric(bank["Amount"], errors="coerce").fillna(0)
+
+    if "Verwendungszweck" not in bank.columns:
+        bank["Verwendungszweck"] = ""
 
     # ==========================
     # BUILD LEDGER
     # ==========================
     ledger = tenants_long.copy()
     ledger["Allocated"] = 0.0
-    ledger["Payment Details"] = [[] for _ in range(len(ledger))]  # fix here
+    ledger["Payment Details"] = [[] for _ in range(len(ledger))]
+
+    unmatched_payments = []
 
     # ==========================
-    # FIFO ALLOCATION WITH PAYMENT DATES & VERWENDUNGSZWECK
+    # AUTO ALLOCATION
     # ==========================
-    for tenant in tenant_names:
-        tenant_payments = bank[bank["Matched Name"] == tenant].to_dict("records")
-        tenant_ledger_idx = ledger[ledger["Artist Name"] == tenant].sort_values("Month").index
+    for _, payment in bank.iterrows():
+        remaining = payment["Amount"]
 
-        for payment in tenant_payments:
-            amount_remaining = payment["Amount"]
-            payment_date = payment["Date"]
-            beschreibung = payment[verwendungs_col] if verwendungs_col else ""
+        matches = ledger[
+            (ledger["Artist Name"].str.lower() == str(payment["Name"]).lower())
+            & (ledger["Allocated"] < ledger["Rent Due"])
+        ].sort_values("Month")
 
-            for idx in tenant_ledger_idx:
-                expected = ledger.at[idx, "Expected Rent"]
-                allocated = ledger.at[idx, "Allocated"]
-                still_due = expected - allocated
+        if len(matches) == 0:
+            unmatched_payments.append(payment)
+            continue
 
-                if still_due > 0:
-                    allocation = min(still_due, amount_remaining)
-                    ledger.at[idx, "Allocated"] += allocation
-                    amount_remaining -= allocation
-                    ledger.at[idx, "Payment Details"].append(
-                        (payment_date, allocation, payment["Amount"], beschreibung)
-                    )
-                if amount_remaining <= 0:
-                    break
+        for idx, row in matches.iterrows():
+            outstanding = row["Rent Due"] - row["Allocated"]
+            allocation = min(outstanding, remaining)
 
-    # ==========================
-    # FORMAT PAYMENT DETAILS & MONTH NAMES
-    # ==========================
-    def format_payment_details(details):
-        details_sorted = sorted(details, key=lambda x: x[0])
-        formatted = [
-            f"{alloc:.0f}/{total:.0f} ({date.strftime('%Y-%m-%d')}" + 
-            (f", {desc}" if desc else "") + ")"
-            for date, alloc, total, desc in details_sorted
-        ]
-        return ", ".join(formatted) if formatted else ""
+            if allocation > 0:
+                ledger.at[idx, "Allocated"] += allocation
+                ledger.at[idx, "Payment Details"].append(
+                    (payment["Date"], allocation, payment["Amount"], payment["Verwendungszweck"])
+                )
+                remaining -= allocation
 
-    ledger["Payment Dates"] = ledger["Payment Details"].apply(format_payment_details)
-    ledger.drop(columns=["Payment Details"], inplace=True)
-    ledger["Month"] = ledger["Month"].dt.strftime("%B")
+            if remaining <= 0:
+                break
 
-    # ==========================
-    # STATUS & BALANCE
-    # ==========================
-    ledger["Difference"] = ledger["Allocated"] - ledger["Expected Rent"]
+        if remaining > 0:
+            unmatched_payments.append(payment)
 
-    def status(row):
-        if row["Allocated"] == 0:
-            return "Unpaid"
-        elif row["Difference"] == 0:
-            return "Paid"
-        elif row["Difference"] < 0:
-            return "Partially Paid"
-        else:
-            return "Overpaid"
+    unmatched_payments = pd.DataFrame(unmatched_payments)
 
-    ledger["Status"] = ledger.apply(status, axis=1)
-    ledger["Balance"] = ledger.groupby("Artist Name")["Difference"].cumsum()
-
-    # ==========================
-    # SUMMARY TABLE
-    # ==========================
-    summary = ledger.groupby("Artist Name").agg(
-        Studio=("Studio", "first"),
-        Total_Expected=("Expected Rent", "sum"),
-        Total_Paid=("Allocated", "sum"),
-        Final_Balance=("Balance", "last")
-    ).reset_index()
-
-    # ==========================
-    # TOGGLE FILTER FOR UNPAID/PARTIAL
-    # ==========================
-    show_only_due = st.checkbox("Show only Unpaid / Partially Paid months")
-
-    if show_only_due:
-        ledger_display = ledger[ledger["Status"].isin(["Unpaid", "Partially Paid"])]
-    else:
-        ledger_display = ledger.copy()
-
-    # ==========================
-    # DISPLAY IN TABS
-    # ==========================
-    st.success("Report generated successfully.")
-
-    tab1, tab2, tab3 = st.tabs(["Ledger", "Summary", "Unmatched Payments"])
-
-    with tab1:
-        # Display ledger grouped by studio
-        for studio, group in ledger_display.groupby("Studio"):
-            st.subheader(f"Studio {studio}")
-            st.dataframe(group)
-
-    with tab2:
-        st.dataframe(summary)
-
-    with tab3:
-        if not unmatched.empty:
-            st.dataframe(unmatched[unmatched_display_cols])
-        else:
-            st.info("No unmatched payments.")
-
-    # ==========================
-    # EXCEL EXPORT (Ledger + Summary + Unmatched)
-    # ==========================
-    buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        ledger.to_excel(writer, sheet_name="Ledger", index=False)
-        summary.to_excel(writer, sheet_name="Summary", index=False)
-        unmatched.to_excel(writer, sheet_name="Unmatched Payments", index=False)
-
-    buffer.seek(0)
-    st.download_button(
-        label="Download Excel Report",
-        data=buffer,
-        file_name="rent_report.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    ledger["Status"] = ledger.apply(
+        lambda row: "Paid"
+        if row["Allocated"] >= row["Rent Due"]
+        else ("Partially Paid" if row["Allocated"] > 0 else "Unpaid"),
+        axis=1
     )
+
+    # ==========================
+    # SESSION STATE
+    # ==========================
+    if "ledger" not in st.session_state:
+        st.session_state.ledger = ledger
+
+    if "unmatched_payments" not in st.session_state:
+        st.session_state.unmatched_payments = unmatched_payments
+
+    if "audit_log" not in st.session_state:
+        st.session_state.audit_log = []
+
+    ledger = st.session_state.ledger
+    unmatched_payments = st.session_state.unmatched_payments
+    audit_log = st.session_state.audit_log
+
+    # ==========================
+    # FUNCTIONS
+    # ==========================
+    def allocate_payment_to_artist(artist_name, amount, date, verwendungszweck):
+        remaining = amount
+
+        target_rows = ledger[
+            (ledger["Artist Name"] == artist_name)
+            & (ledger["Allocated"] < ledger["Rent Due"])
+        ].sort_values("Month")
+
+        for idx, row in target_rows.iterrows():
+            outstanding = row["Rent Due"] - row["Allocated"]
+            allocation = min(outstanding, remaining)
+
+            if allocation > 0:
+                ledger.at[idx, "Allocated"] += allocation
+                ledger.at[idx, "Payment Details"].append(
+                    (date, allocation, amount, verwendungszweck)
+                )
+                remaining -= allocation
+
+            if remaining <= 0:
+                break
+
+    def undo_last_allocation():
+        if len(audit_log) == 0:
+            return
+
+        last = audit_log.pop()
+        artist = last["Artist"]
+        amount = last["Amount"]
+
+        rows = ledger[
+            (ledger["Artist Name"] == artist)
+            & (ledger["Allocated"] > 0)
+        ].sort_values("Month", ascending=False)
+
+        remaining = amount
+
+        for idx, row in rows.iterrows():
+            deduction = min(row["Allocated"], remaining)
+            ledger.at[idx, "Allocated"] -= deduction
+            remaining -= deduction
+
+            if remaining <= 0:
+                break
+
+    # ==========================
+    # TABS
+    # ==========================
+    tab1, tab2, tab3, tab4 = st.tabs(
+        ["Ledger", "Summary", "Allocate Unmatched", "Audit Log"]
+    )
+
+    # ==========================
+    # LEDGER TAB
+    # ==========================
+    with tab1:
+
+        show_unpaid = st.checkbox("Show only unpaid / partially paid")
+
+        display = ledger.copy()
+
+        if show_unpaid:
+            display = display[display["Status"] != "Paid"]
+
+        display = display.sort_values(["Studio", "Studio Order", "Month"])
+
+        display["Payment Details"] = display["Payment Details"].apply(
+            lambda details: ", ".join(
+                f"{alloc:.0f}/{total:.0f} ({date.strftime('%Y-%m-%d')}, {desc})"
+                for date, alloc, total, desc in sorted(details, key=lambda x: x[0])
+            ) if len(details) > 0 else ""
+        )
+
+        st.dataframe(display, use_container_width=True)
+
+    # ==========================
+    # SUMMARY TAB
+    # ==========================
+    with tab2:
+
+        summary = ledger.groupby("Artist Name").agg(
+            Total_Due=("Rent Due", "sum"),
+            Total_Paid=("Allocated", "sum")
+        )
+
+        summary["Outstanding"] = summary["Total_Due"] - summary["Total_Paid"]
+
+        st.dataframe(summary, use_container_width=True)
+
+        output = BytesIO()
+        with pd.ExcelWriter(output, engine="openpyxl") as writer:
+            ledger.to_excel(writer, sheet_name="Ledger", index=False)
+            summary.to_excel(writer, sheet_name="Summary")
+            unmatched_payments.to_excel(writer, sheet_name="Unmatched", index=False)
+
+        st.download_button(
+            "Download Excel Report",
+            output.getvalue(),
+            file_name="studio_rent_report.xlsx"
+        )
+
+        if st.button("Undo Last Allocation"):
+            undo_last_allocation()
+            st.success("Last allocation undone")
+            st.experimental_rerun()
+
+    # ==========================
+    # ALLOCATE UNMATCHED
+    # ==========================
+    with tab3:
+
+        if len(unmatched_payments) == 0:
+            st.success("No unmatched payments 🎉")
+        else:
+            artists = sorted(ledger["Artist Name"].unique())
+
+            for i, payment in unmatched_payments.iterrows():
+                st.markdown("---")
+                st.write(payment)
+
+                selected_artist = st.selectbox(
+                    "Assign to Artist",
+                    artists,
+                    key=f"artist_{i}"
+                )
+
+                allocation_amount = st.number_input(
+                    "Amount to allocate",
+                    min_value=0.0,
+                    max_value=float(payment["Amount"]),
+                    value=float(payment["Amount"]),
+                    key=f"amount_{i}"
+                )
+
+                if st.button("Allocate", key=f"allocate_{i}"):
+
+                    allocate_payment_to_artist(
+                        selected_artist,
+                        allocation_amount,
+                        payment["Date"],
+                        payment.get("Verwendungszweck", "")
+                    )
+
+                    remaining = payment["Amount"] - allocation_amount
+
+                    audit_log.append({
+                        "Action": "Manual Allocation",
+                        "Date": payment["Date"],
+                        "Artist": selected_artist,
+                        "Amount": allocation_amount,
+                        "Verwendungszweck": payment.get("Verwendungszweck", "")
+                    })
+
+                    if remaining > 0:
+                        unmatched_payments.at[i, "Amount"] = remaining
+                    else:
+                        unmatched_payments = unmatched_payments.drop(i)
+
+                    st.session_state.unmatched_payments = unmatched_payments
+                    st.success("Allocation completed")
+                    st.experimental_rerun()
+
+    # ==========================
+    # AUDIT LOG
+    # ==========================
+    with tab4:
+        if len(audit_log) == 0:
+            st.info("No actions recorded yet.")
+        else:
+            st.dataframe(pd.DataFrame(audit_log), use_container_width=True)
