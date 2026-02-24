@@ -108,7 +108,7 @@ if bank_file and tenant_file:
     # ==========================
     ledger = tenants_long.copy()
     ledger["Allocated"] = 0.0
-    ledger["Payment Details"] = []
+    ledger["Payment Details"] = [[] for _ in range(len(ledger))]  # fix here
 
     # ==========================
     # FIFO ALLOCATION WITH PAYMENT DATES & VERWENDUNGSZWECK
