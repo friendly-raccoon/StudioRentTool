@@ -7,8 +7,8 @@ st.set_page_config(page_title="Studio Rent Tool", layout="wide")
 
 MATCH_THRESHOLD = 85
 
-st.title("Studio Rent Accounting Tool (Cloud Version)")
-st.markdown("Upload bank CSV and tenant Excel file to generate rent ledger.")
+st.title("Studio Rent Accounting Tool")
+st.markdown("Upload bank CSV and tenant Excel file to generate rent ledger with payment dates.")
 
 # ==========================
 # FILE UPLOAD
@@ -28,6 +28,10 @@ if bank_file and tenant_file:
 
     required_bank_cols = {"Date", "Amount", "Name"}
     required_tenant_cols = {"Studio", "Artist Name", "Monthly Rent"}
+
+    # Trim column names
+    bank.columns = bank.columns.str.strip()
+    tenants.columns = tenants.columns.str.strip()
 
     if not required_bank_cols.issubset(bank.columns):
         st.error("Bank CSV must contain columns: Date, Amount, Name")
@@ -78,7 +82,6 @@ if bank_file and tenant_file:
     # ==========================
 
     bank["YearMonth"] = bank["Date"].dt.to_period("M")
-
     all_months = pd.period_range(
         start=bank["YearMonth"].min(),
         end=bank["YearMonth"].max(),
@@ -98,14 +101,15 @@ if bank_file and tenant_file:
                 "Artist Name": tenant["Artist Name"],
                 "Month": month.to_timestamp(),
                 "Expected Rent": tenant["Monthly Rent"],
-                "Allocated": 0.0
+                "Allocated": 0.0,
+                "Payment Dates": ""
             })
 
     ledger = pd.DataFrame(records)
     ledger = ledger.sort_values(["Artist Name", "Month"])
 
     # ==========================
-    # FIFO ALLOCATION
+    # FIFO ALLOCATION WITH PAYMENT DATES
     # ==========================
 
     for tenant in tenant_names:
@@ -125,6 +129,13 @@ if bank_file and tenant_file:
                     allocation = min(still_due, amount_remaining)
                     ledger.at[idx, "Allocated"] += allocation
                     amount_remaining -= allocation
+
+                    # --- Track payment dates ---
+                    payment_date_str = payment["Date"].strftime("%Y-%m-%d")
+                    if ledger.at[idx, "Payment Dates"] == "":
+                        ledger.at[idx, "Payment Dates"] = payment_date_str
+                    else:
+                        ledger.at[idx, "Payment Dates"] += ", " + payment_date_str
 
                 if amount_remaining <= 0:
                     break
@@ -149,7 +160,7 @@ if bank_file and tenant_file:
     ledger["Balance"] = ledger.groupby("Artist Name")["Difference"].cumsum()
 
     # ==========================
-    # SUMMARY
+    # SUMMARY TABLE
     # ==========================
 
     summary = ledger.groupby("Artist Name").agg(
@@ -157,6 +168,10 @@ if bank_file and tenant_file:
         Total_Paid=("Allocated", "sum"),
         Final_Balance=("Balance", "last")
     ).reset_index()
+
+    # ==========================
+    # DISPLAY
+    # ==========================
 
     st.success("Report generated successfully.")
 
