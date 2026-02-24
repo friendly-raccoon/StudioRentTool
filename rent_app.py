@@ -2,13 +2,14 @@ import streamlit as st
 import pandas as pd
 from rapidfuzz import process, fuzz
 import io
+from collections import defaultdict
 
 st.set_page_config(page_title="Studio Rent Tool", layout="wide")
 
 MATCH_THRESHOLD = 85
 
 st.title("Studio Rent Accounting Tool")
-st.markdown("Upload bank CSV and tenant Excel file to generate rent ledger with payment dates.")
+st.markdown("Upload bank CSV and tenant Excel file to generate rent ledger with payment dates and allocations.")
 
 # ==========================
 # FILE UPLOAD
@@ -99,26 +100,27 @@ if bank_file and tenant_file:
             records.append({
                 "Studio": tenant["Studio"],
                 "Artist Name": tenant["Artist Name"],
-                "Month": month.to_timestamp(),
+                "Month": month.to_timestamp(),  # we'll display as name later
                 "Expected Rent": tenant["Monthly Rent"],
                 "Allocated": 0.0,
-                "Payment Dates": ""
+                "Payment Details": []  # will hold tuples of (date, allocated, total_payment)
             })
 
     ledger = pd.DataFrame(records)
     ledger = ledger.sort_values(["Artist Name", "Month"])
 
     # ==========================
-    # FIFO ALLOCATION WITH PAYMENT DATES
+    # FIFO ALLOCATION WITH PAYMENT DATES & AMOUNTS
     # ==========================
 
     for tenant in tenant_names:
 
-        tenant_payments = bank[bank["Matched Name"] == tenant]
+        tenant_payments = bank[bank["Matched Name"] == tenant].to_dict("records")
         tenant_ledger_idx = ledger[ledger["Artist Name"] == tenant].index
 
-        for _, payment in tenant_payments.iterrows():
+        for payment in tenant_payments:
             amount_remaining = payment["Amount"]
+            payment_date = payment["Date"]
 
             for idx in tenant_ledger_idx:
                 expected = ledger.at[idx, "Expected Rent"]
@@ -130,15 +132,32 @@ if bank_file and tenant_file:
                     ledger.at[idx, "Allocated"] += allocation
                     amount_remaining -= allocation
 
-                    # --- Track payment dates ---
-                    payment_date_str = payment["Date"].strftime("%Y-%m-%d")
-                    if ledger.at[idx, "Payment Dates"] == "":
-                        ledger.at[idx, "Payment Dates"] = payment_date_str
-                    else:
-                        ledger.at[idx, "Payment Dates"] += ", " + payment_date_str
+                    # --- track payment detail ---
+                    ledger.at[idx, "Payment Details"].append(
+                        (payment_date, allocation, payment["Amount"])
+                    )
 
                 if amount_remaining <= 0:
                     break
+
+    # ==========================
+    # FORMAT PAYMENT DETAILS & SORT DATES
+    # ==========================
+
+    def format_payment_details(details):
+        # sort by date
+        details_sorted = sorted(details, key=lambda x: x[0])
+        formatted = [f"{alloc:.0f}/{total:.0f} ({date.strftime('%Y-%m-%d')})" for date, alloc, total in details_sorted]
+        return ", ".join(formatted) if formatted else ""
+
+    ledger["Payment Dates"] = ledger["Payment Details"].apply(format_payment_details)
+    ledger.drop(columns=["Payment Details"], inplace=True)
+
+    # ==========================
+    # FORMAT MONTH NAMES
+    # ==========================
+
+    ledger["Month"] = ledger["Month"].dt.strftime("%B")  # January, February, etc.
 
     # ==========================
     # STATUS & BALANCE
