@@ -200,17 +200,17 @@ if bank_file and tenant_file:
         st.dataframe(ledger)
 
     with tab2:
-    st.write("Summary Table")
-    st.dataframe(summary)
+        st.write("Summary Table")
+        st.dataframe(summary)
 
-    st.write("Click to see payments per tenant:")
-    for tenant in summary["Artist Name"]:
-        # Filter ledger for this tenant
-        tenant_ledger = ledger[ledger["Artist Name"] == tenant][[
-            "Studio", "Month", "Expected Rent", "Allocated", "Status", "Payment Dates"
-        ]]
-        with st.expander(f"{tenant} — click to view payments"):
-            st.dataframe(tenant_ledger)
+        st.write("Click to see payments per tenant:")
+        for tenant in summary["Artist Name"]:
+            # Filter ledger for this tenant
+            tenant_ledger = ledger[ledger["Artist Name"] == tenant][[
+                "Studio", "Month", "Expected Rent", "Allocated", "Status", "Payment Dates"
+            ]]
+            with st.expander(f"{tenant} — click to view payments"):
+                st.dataframe(tenant_ledger)
 
     # ==========================
     # IN-MEMORY EXCEL EXPORT
