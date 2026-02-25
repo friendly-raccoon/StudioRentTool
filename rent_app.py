@@ -228,7 +228,12 @@ if "ledger" in st.session_state:
     # -------------------------
 
     with tab1:
-        st.dataframe(ledger)
+        display_ledger = ledger.copy()
+
+    if "Payment Details" in display_ledger.columns:
+        display_ledger["Payment Details"] = display_ledger["Payment Details"].astype(str)
+
+st.dataframe(display_ledger)
 
     # -------------------------
     # Unmatched
