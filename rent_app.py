@@ -1,296 +1,150 @@
 import streamlit as st
 import pandas as pd
-import os
-from datetime import datetime
+from thefuzz import process
 from io import BytesIO
 
-# Excel export
-from openpyxl import Workbook
+st.set_page_config(page_title="Advanced Rent Allocation", layout="wide")
+st.title("🏠 Advanced Rent Allocation App")
 
-# PDF export
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table
-from reportlab.lib import colors
-from reportlab.lib.styles import getSampleStyleSheet
+st.markdown("""
+Upload your **tenant Excel** and **bank payment CSV**. The app will allocate payments, compute partial/overpayments, maintain balances, 
+and generate a downloadable Excel report with unmatched payments.
+""")
 
-# -----------------------------
-# CONFIG
-# -----------------------------
-DATABASE_FILE = "rent_database.csv"
-ALLOCATIONS_FILE = "allocations.csv"
+# -------------------------
+# 1️⃣ Upload Tenant Excel
+# -------------------------
+tenant_file = st.file_uploader("Upload Tenant Excel", type=["xlsx", "xls"])
+if tenant_file:
+    # Let user select sheet if multiple
+    xls = pd.ExcelFile(tenant_file)
+    sheet_name = st.selectbox("Select sheet with tenant data", xls.sheet_names)
+    tenants = pd.read_excel(xls, sheet_name=sheet_name)
 
-# -----------------------------
-# INITIAL SETUP
-# -----------------------------
-if not os.path.exists(DATABASE_FILE):
-    pd.DataFrame(columns=["Date", "Amount", "Description", "Payment_ID"]).to_csv(DATABASE_FILE, index=False)
+    st.write("Columns detected in sheet:", list(tenants.columns))
+    
+    # Ask user to select the columns to use
+    studio_col = st.selectbox("Select Studio Number column", tenants.columns)
+    artist_col = st.selectbox("Select Artist Name column", tenants.columns)
+    rent_col = st.selectbox("Select Expected Rent column", tenants.columns)
+    
+    # Keep only needed columns
+    tenants = tenants[[studio_col, artist_col, rent_col]]
+    tenants.columns = ["Studio", "Artist", "Expected Rent"]
+    
+    # Initialize balance column
+    if "Balance" not in tenants.columns:
+        tenants["Balance"] = 0.0
 
-if not os.path.exists(ALLOCATIONS_FILE):
-    pd.DataFrame(columns=["Payment_ID", "Allocated_To", "Category"]).to_csv(
-        ALLOCATIONS_FILE, index=False
-    )
+    st.subheader("Tenant List")
+    st.dataframe(tenants)
 
-# -----------------------------
-# LOAD DATA
-# -----------------------------
-def load_database():
-    try:
-        df = pd.read_csv(DATABASE_FILE, parse_dates=["Date"])
-        for col in ["Date", "Amount", "Description", "Payment_ID"]:
-            if col not in df.columns:
-                df[col] = pd.NA
-        return df
-    except Exception:
-        return pd.DataFrame(columns=["Date", "Amount", "Description", "Payment_ID"])
+# -------------------------
+# 2️⃣ Upload Payment CSV
+# -------------------------
+payment_file = st.file_uploader("Upload Payments CSV", type="csv")
+if payment_file:
+    payments = pd.read_csv(payment_file)
+    
+    st.write("Columns detected in payment CSV:", list(payments.columns))
+    
+    # Ask user which columns to use
+    amount_col = st.selectbox("Select payment amount column", payments.columns)
+    name_col = st.selectbox("Select payer/artist name column", payments.columns)
+    
+    # Keep only needed columns
+    payments = payments[[name_col, amount_col]]
+    payments.columns = ["Payer", "Amount Paid"]
+    
+    # Filter only positive amounts (incoming payments)
+    payments = payments[payments["Amount Paid"] > 0].copy()
+    
+    st.subheader("Payments Upload")
+    st.dataframe(payments)
 
-def load_allocations():
-    try:
-        df = pd.read_csv(ALLOCATIONS_FILE)
-        for col in ["Payment_ID", "Allocated_To", "Category"]:
-            if col not in df.columns:
-                df[col] = pd.NA
-        return df
-    except Exception:
-        return pd.DataFrame(columns=["Payment_ID", "Allocated_To", "Category"])
-
-def save_database(df):
-    df.to_csv(DATABASE_FILE, index=False)
-
-def save_allocations(df):
-    df.to_csv(ALLOCATIONS_FILE, index=False)
-
-# -----------------------------
-# MATCHING LOGIC
-# -----------------------------
-def match_payment(row, tenants):
-    for name in tenants:
-        if name.lower() in str(row["Description"]).lower():
-            return name
-    return None
-
-# -----------------------------
-# STREAMLIT UI
-# -----------------------------
-st.title("🏢 Studio Rent Manager")
-
-st.sidebar.header("Upload Banking CSV")
-uploaded_file = st.sidebar.file_uploader("Upload monthly banking CSV", type=["csv"])
-
-database = load_database()
-allocations = load_allocations()
-
-# -----------------------------
-# UPLOAD & APPEND PAYMENTS
-# -----------------------------
-if uploaded_file:
-    new_data = pd.read_csv(uploaded_file)
-    required_cols = ["Date", "Amount", "Description"]
-    if not all(col in new_data.columns for col in required_cols):
-        st.error("CSV must contain: Date, Amount, Description")
-    else:
-        new_data["Date"] = pd.to_datetime(new_data["Date"])
-        new_data["Payment_ID"] = (
-            new_data["Date"].astype(str)
-            + new_data["Amount"].astype(str)
-            + new_data["Description"]
-        )
-
-        new_data = new_data[new_data["Amount"] > 0]  # only incoming payments
-
-        if not database.empty:
-            new_data = new_data[~new_data["Payment_ID"].isin(database["Payment_ID"])]
-
-        database = pd.concat([database, new_data], ignore_index=True)
-        save_database(database)
-        st.success("New payments appended to database.")
-
-# -----------------------------
-# TENANTS SETUP
-# -----------------------------
-st.sidebar.header("Tenant List (Excel Upload)")
-
-# Default tenants fallback
-default_tenants = {
-    "Studio 1": "Anna Schmidt",
-    "Studio 2": "Jonas Weber",
-    "Studio 3": "Mira Klein",
-    "Studio 4": "David Fischer",
-}
-
-uploaded_tenants = st.sidebar.file_uploader("Upload tenant Excel file", type=["xlsx"])
-
-months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
-
-if uploaded_tenants:
-    try:
-        tenant_df = pd.read_excel(uploaded_tenants)
-        required_cols = ["Studio", "Tenant"] + months
-        if not all(col in tenant_df.columns for col in required_cols):
-            st.error(f"Tenant Excel must contain columns: {', '.join(required_cols)}")
-            tenant_df = pd.DataFrame(
-                [(k, v, *[500]*12) for k,v in default_tenants.items()],
-                columns=["Studio","Tenant"]+months
-            )
-    except Exception as e:
-        st.error(f"Error reading tenant Excel: {e}")
-        tenant_df = pd.DataFrame(
-            [(k, v, *[500]*12) for k,v in default_tenants.items()],
-            columns=["Studio","Tenant"]+months
-        )
-else:
-    tenant_df = pd.DataFrame(
-        [(k, v, *[500]*12) for k,v in default_tenants.items()],
-        columns=["Studio","Tenant"]+months
-    )
-
-tenants = list(tenant_df["Tenant"])
-
-# -----------------------------
-# MATCH PAYMENTS
-# -----------------------------
-if not database.empty:
-    database["Matched_Tenant"] = database.apply(lambda row: match_payment(row, tenants), axis=1)
-    database = database.merge(allocations, on="Payment_ID", how="left")
-
-# -----------------------------
-# SORTING
-# -----------------------------
-st.sidebar.header("Sorting")
-sort_option = st.sidebar.selectbox("Sort by", ["Date", "Tenant Name", "Studio"])
-
-if not database.empty:
-    if sort_option == "Tenant Name" and "Matched_Tenant" in database.columns:
-        database = database.sort_values("Matched_Tenant")
-    elif sort_option == "Studio" and "Matched_Tenant" in database.columns:
-        database = database.merge(tenant_df, left_on="Matched_Tenant", right_on="Tenant", how="left")
-        database = database.sort_values("Studio")
-    elif sort_option == "Date" and "Date" in database.columns:
-        database = database.sort_values("Date", ascending=False)
-
-# -----------------------------
-# DASHBOARD
-# -----------------------------
-st.header("Incoming Payments Overview")
-if not database.empty:
-    total_income = database["Amount"].sum()
-    st.metric("Total Income", f"{total_income:.2f} €")
-    st.dataframe(database)
-
-# -----------------------------
-# UNMATCHED PAYMENTS (Batch Allocation Form)
-# -----------------------------
-st.header("Unmatched Payments")
-
-if not database.empty:
-    unmatched = database[database.get("Matched_Tenant").isna() & database.get("Allocated_To").isna()]
-else:
-    unmatched = pd.DataFrame()
-
-if not unmatched.empty:
-    st.write("Allocate unmatched payments to studios or mark as Other.")
-
-    with st.form("allocate_form"):
-        allocation_choices = {}
-        for idx, row in unmatched.iterrows():
-            st.write(f"{row['Date'].date() if pd.notna(row['Date']) else 'No Date'} | {row['Amount']} € | {row['Description']}")
-            allocation_choices[row["Payment_ID"]] = st.selectbox(
-                f"Allocate payment {row['Payment_ID']}", 
-                options=list(tenant_df["Studio"]) + ["Other"], 
-                index=0
-            )
+# -------------------------
+# 3️⃣ Allocate Payments
+# -------------------------
+if tenant_file and payment_file:
+    allocated_rows = []
+    unmatched_rows = []
+    
+    # Set fuzzy matching threshold
+    threshold = 80
+    
+    # Copy tenants to track balances
+    tenants_copy = tenants.copy()
+    
+    # Go through each payment
+    for _, pay_row in payments.iterrows():
+        payer_name = str(pay_row["Payer"]).strip()
+        amount = float(pay_row["Amount Paid"])
         
-        submit_alloc = st.form_submit_button("Apply Allocations")
+        # Use fuzzy matching on Artist names
+        best_match, score = process.extractOne(payer_name, tenants_copy["Artist"])
         
-        if submit_alloc:
-            new_alloc_list = []
-            for pid, studio in allocation_choices.items():
-                category = "Studio" if studio != "Other" else "Other"
-                new_alloc_list.append([pid, studio, category])
+        if score >= threshold:
+            idx = tenants_copy[tenants_copy["Artist"] == best_match].index[0]
             
-            if new_alloc_list:
-                new_alloc_df = pd.DataFrame(new_alloc_list, columns=["Payment_ID", "Allocated_To", "Category"])
-                allocations = pd.concat([allocations, new_alloc_df], ignore_index=True)
-                save_allocations(allocations)
-                st.success(f"{len(new_alloc_list)} payment allocations saved.")
-                st.experimental_rerun()
-
-# -----------------------------
-# UNDO ALLOCATION
-# -----------------------------
-st.header("Undo Allocation")
-allocated = pd.DataFrame()
-if not database.empty:
-    allocated = database[database.get("Allocated_To").notna()]
-
-if not allocated.empty:
-    for _, row in allocated.iterrows():
-        st.write(f"{row['Date'].date() if pd.notna(row['Date']) else 'No Date'} | {row['Amount']} € → {row['Allocated_To']}")
-        if st.button("Undo", key=row["Payment_ID"]+"_undo"):
-            allocations = allocations[allocations["Payment_ID"] != row["Payment_ID"]]
-            save_allocations(allocations)
-            st.experimental_rerun()
-
-# -----------------------------
-# OVERPAYMENT TRACKING
-# -----------------------------
-st.header("Over / Underpayment Tracking")
-
-summary = []
-
-if not database.empty:
-    database["Month"] = database["Date"].dt.strftime("%b")  # e.g., 'Jan', 'Feb', ...
-
-for _, tenant_row in tenant_df.iterrows():
-    studio = tenant_row["Studio"]
-    tenant = tenant_row["Tenant"]
+            expected = tenants_copy.at[idx, "Expected Rent"]
+            balance = tenants_copy.at[idx, "Balance"]
+            
+            # Compute new balance
+            new_balance = balance + amount - expected
+            tenants_copy.at[idx, "Balance"] = new_balance
+            
+            # Determine status
+            if new_balance == 0:
+                status = "Paid in full ✅"
+            elif new_balance > 0:
+                status = f"Overpaid 💰 (+{new_balance:.2f})"
+            else:
+                status = f"Partial ⚠️ ({new_balance:.2f})"
+            
+            allocated_rows.append({
+                "Studio": tenants_copy.at[idx, "Studio"],
+                "Artist": best_match,
+                "Expected Rent": expected,
+                "Amount Paid": amount,
+                "Balance": new_balance,
+                "Status": status
+            })
+        else:
+            # No match → add to unmatched
+            unmatched_rows.append({
+                "Payer": payer_name,
+                "Amount Paid": amount
+            })
     
-    tenant_payments = database[database.get("Matched_Tenant") == tenant] if not database.empty else pd.DataFrame()
+    allocated_df = pd.DataFrame(allocated_rows)
+    unmatched_df = pd.DataFrame(unmatched_rows)
     
-    total_paid = tenant_payments["Amount"].sum() if not tenant_payments.empty else 0
-    expected_total = 0
+    st.subheader("💡 Payment Allocation Summary")
+    st.dataframe(allocated_df)
+
+    if not unmatched_df.empty:
+        st.subheader("⚠️ Unmatched Payments")
+        st.dataframe(unmatched_df)
     
-    if not tenant_payments.empty:
-        for _, pay in tenant_payments.iterrows():
-            month_col = pay["Month"]
-            if month_col in tenant_row:
-                expected_total += tenant_row[month_col]
+    # -------------------------
+    # 4️⃣ Export Excel
+    # -------------------------
+    def to_excel(allocated, unmatched):
+        output = BytesIO()
+        writer = pd.ExcelWriter(output, engine="xlsxwriter")
+        
+        allocated.to_excel(writer, index=False, sheet_name="Allocated Payments")
+        unmatched.to_excel(writer, index=False, sheet_name="Unmatched Payments")
+        
+        writer.save()
+        processed_data = output.getvalue()
+        return processed_data
     
-    difference = total_paid - expected_total
-    summary.append([studio, tenant, total_paid, expected_total, difference])
-
-summary_df = pd.DataFrame(summary, columns=["Studio","Tenant","Total Paid","Expected Rent","Difference"])
-st.dataframe(summary_df)
-
-# -----------------------------
-# EXPORT FUNCTIONS
-# -----------------------------
-def export_excel(df):
-    output = BytesIO()
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Rent Overview"
-    ws.append(list(df.columns))
-    for row in df.itertuples(index=False):
-        ws.append(row)
-    wb.save(output)
-    return output.getvalue()
-
-def export_pdf(df):
-    buffer = BytesIO()
-    doc = SimpleDocTemplate(buffer)
-    elements = []
-    style = getSampleStyleSheet()
-    elements.append(Paragraph("Studio Rent Overview", style["Heading1"]))
-    elements.append(Spacer(1, 12))
-    data = [list(df.columns)] + df.values.tolist()
-    table = Table(data)
-    table.setStyle([("BACKGROUND",(0,0),(-1,0),colors.grey),("GRID",(0,0),(-1,-1),0.5,colors.black)])
-    elements.append(table)
-    doc.build(elements)
-    return buffer.getvalue()
-
-st.header("Export")
-if not summary_df.empty:
-    excel_file = export_excel(summary_df)
-    pdf_file = export_pdf(summary_df)
-    st.download_button("Download Excel", excel_file, file_name="rent_overview.xlsx")
-    st.download_button("Download PDF", pdf_file, file_name="rent_overview.pdf")
+    excel_data = to_excel(allocated_df, unmatched_df)
+    
+    st.download_button(
+        label="📥 Download Allocated Payments Excel",
+        data=excel_data,
+        file_name="rent_allocation.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
