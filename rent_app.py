@@ -11,76 +11,72 @@ from openpyxl import Workbook
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.lib import utils
 
 # -----------------------------
 # CONFIG
 # -----------------------------
-
 DATABASE_FILE = "rent_database.csv"
 ALLOCATIONS_FILE = "allocations.csv"
 
 EXPECTED_RENT = 500  # Adjust if needed
 
-
 # -----------------------------
 # INITIAL SETUP
 # -----------------------------
-
 if not os.path.exists(DATABASE_FILE):
-    pd.DataFrame().to_csv(DATABASE_FILE, index=False)
+    pd.DataFrame(columns=["Date", "Amount", "Description", "Payment_ID"]).to_csv(DATABASE_FILE, index=False)
 
 if not os.path.exists(ALLOCATIONS_FILE):
     pd.DataFrame(columns=["Payment_ID", "Allocated_To", "Category"]).to_csv(
         ALLOCATIONS_FILE, index=False
     )
 
-
 # -----------------------------
 # LOAD DATA
 # -----------------------------
-
 def load_database():
     try:
-        return pd.read_csv(DATABASE_FILE, parse_dates=["Date"])
-    except:
-        return pd.DataFrame()
-
+        df = pd.read_csv(DATABASE_FILE, parse_dates=["Date"])
+        # Ensure expected columns exist
+        for col in ["Date", "Amount", "Description", "Payment_ID"]:
+            if col not in df.columns:
+                df[col] = pd.NA
+        return df
+    except Exception:
+        # Return empty DataFrame with required columns
+        return pd.DataFrame(columns=["Date", "Amount", "Description", "Payment_ID"])
 
 def load_allocations():
     try:
-        return pd.read_csv(ALLOCATIONS_FILE)
-    except:
+        df = pd.read_csv(ALLOCATIONS_FILE)
+        for col in ["Payment_ID", "Allocated_To", "Category"]:
+            if col not in df.columns:
+                df[col] = pd.NA
+        return df
+    except Exception:
         return pd.DataFrame(columns=["Payment_ID", "Allocated_To", "Category"])
-
 
 def save_database(df):
     df.to_csv(DATABASE_FILE, index=False)
 
-
 def save_allocations(df):
     df.to_csv(ALLOCATIONS_FILE, index=False)
-
 
 # -----------------------------
 # MATCHING LOGIC
 # -----------------------------
-
 def match_payment(row, tenants):
     for name in tenants:
         if name.lower() in str(row["Description"]).lower():
             return name
     return None
 
-
 # -----------------------------
 # STREAMLIT UI
 # -----------------------------
-
 st.title("🏢 Studio Rent Manager")
 
 st.sidebar.header("Upload Banking CSV")
-
 uploaded_file = st.sidebar.file_uploader("Upload monthly CSV", type=["csv"])
 
 database = load_database()
@@ -89,7 +85,6 @@ allocations = load_allocations()
 # -----------------------------
 # UPLOAD & APPEND
 # -----------------------------
-
 if uploaded_file:
     new_data = pd.read_csv(uploaded_file)
 
@@ -114,13 +109,11 @@ if uploaded_file:
 
         database = pd.concat([database, new_data], ignore_index=True)
         save_database(database)
-
         st.success("New payments appended to database.")
 
 # -----------------------------
 # TENANTS SETUP
 # -----------------------------
-
 st.sidebar.header("Tenants")
 
 default_tenants = {
@@ -140,12 +133,10 @@ tenants = list(tenant_df["Tenant"])
 # -----------------------------
 # MATCH PAYMENTS
 # -----------------------------
-
 if not database.empty:
     database["Matched_Tenant"] = database.apply(
         lambda row: match_payment(row, tenants), axis=1
     )
-
     database = database.merge(
         allocations,
         on="Payment_ID",
@@ -155,7 +146,6 @@ if not database.empty:
 # -----------------------------
 # SORTING
 # -----------------------------
-
 st.sidebar.header("Sorting")
 
 sort_option = st.sidebar.selectbox(
@@ -163,54 +153,52 @@ sort_option = st.sidebar.selectbox(
     ["Date", "Tenant Name", "Studio"]
 )
 
-if sort_option == "Tenant Name":
-    database = database.sort_values("Matched_Tenant")
-elif sort_option == "Studio":
-    database = database.merge(
-        tenant_df, left_on="Matched_Tenant", right_on="Tenant", how="left"
-    )
-    database = database.sort_values("Studio")
-else:
-    database = database.sort_values("Date", ascending=False)
+if not database.empty:
+    if sort_option == "Tenant Name" and "Matched_Tenant" in database.columns:
+        database = database.sort_values("Matched_Tenant")
+    elif sort_option == "Studio":
+        if "Matched_Tenant" in database.columns:
+            database = database.merge(
+                tenant_df, left_on="Matched_Tenant", right_on="Tenant", how="left"
+            )
+            database = database.sort_values("Studio")
+    elif sort_option == "Date" and "Date" in database.columns:
+        database = database.sort_values("Date", ascending=False)
 
 # -----------------------------
 # DASHBOARD
 # -----------------------------
-
 st.header("Incoming Payments Overview")
 
 if not database.empty:
     total_income = database["Amount"].sum()
     st.metric("Total Income", f"{total_income:.2f} €")
-
     st.dataframe(database)
 
 # -----------------------------
 # UNMATCHED PAYMENTS
 # -----------------------------
-
 st.header("Unmatched Payments")
 
-unmatched = database[
-    database["Matched_Tenant"].isna()
-    & database["Allocated_To"].isna()
-]
+unmatched = pd.DataFrame()
+if not database.empty:
+    unmatched = database[
+        database.get("Matched_Tenant").isna() &
+        database.get("Allocated_To").isna()
+    ]
 
 if not unmatched.empty:
     for _, row in unmatched.iterrows():
         st.write(
-            f"{row['Date'].date()} | {row['Amount']} € | {row['Description']}"
+            f"{row['Date'].date() if pd.notna(row['Date']) else 'No Date'} | {row['Amount']} € | {row['Description']}"
         )
-
         col1, col2 = st.columns(2)
-
         with col1:
             studio = st.selectbox(
                 f"Allocate to studio",
                 list(default_tenants.keys()),
                 key=row["Payment_ID"],
             )
-
             if st.button("Allocate", key=row["Payment_ID"] + "_alloc"):
                 new_alloc = pd.DataFrame(
                     [[row["Payment_ID"], studio, "Studio"]],
@@ -218,8 +206,7 @@ if not unmatched.empty:
                 )
                 allocations = pd.concat([allocations, new_alloc])
                 save_allocations(allocations)
-                st.rerun()
-
+                st.experimental_rerun()
         with col2:
             if st.button("Mark as Other", key=row["Payment_ID"] + "_other"):
                 new_alloc = pd.DataFrame(
@@ -228,41 +215,43 @@ if not unmatched.empty:
                 )
                 allocations = pd.concat([allocations, new_alloc])
                 save_allocations(allocations)
-                st.rerun()
+                st.experimental_rerun()
 
 # -----------------------------
 # UNDO ALLOCATION
 # -----------------------------
-
 st.header("Undo Allocation")
 
-allocated = database[database["Allocated_To"].notna()]
+allocated = pd.DataFrame()
+if not database.empty:
+    allocated = database[database.get("Allocated_To").notna()]
 
 if not allocated.empty:
     for _, row in allocated.iterrows():
         st.write(
-            f"{row['Date'].date()} | {row['Amount']} € → {row['Allocated_To']}"
+            f"{row['Date'].date() if pd.notna(row['Date']) else 'No Date'} | {row['Amount']} € → {row['Allocated_To']}"
         )
         if st.button("Undo", key=row["Payment_ID"] + "_undo"):
             allocations = allocations[
                 allocations["Payment_ID"] != row["Payment_ID"]
             ]
             save_allocations(allocations)
-            st.rerun()
+            st.experimental_rerun()
 
 # -----------------------------
 # OVERPAYMENT TRACKING
 # -----------------------------
-
 st.header("Over / Underpayment Tracking")
 
 summary = []
 
 for studio, tenant in default_tenants.items():
-    tenant_payments = database[
-        database["Matched_Tenant"] == tenant
-    ]
-    total_paid = tenant_payments["Amount"].sum()
+    tenant_payments = pd.DataFrame()
+    if not database.empty:
+        tenant_payments = database[
+            database.get("Matched_Tenant") == tenant
+        ]
+    total_paid = tenant_payments["Amount"].sum() if not tenant_payments.empty else 0
     difference = total_paid - EXPECTED_RENT
     summary.append([studio, tenant, total_paid, difference])
 
@@ -276,37 +265,30 @@ st.dataframe(summary_df)
 # -----------------------------
 # EXPORT FUNCTIONS
 # -----------------------------
-
 def export_excel(df):
     output = BytesIO()
     wb = Workbook()
     ws = wb.active
     ws.title = "Rent Overview"
-
     ws.append(list(df.columns))
     for row in df.itertuples(index=False):
         ws.append(row)
-
     wb.save(output)
     return output.getvalue()
-
 
 def export_pdf(df):
     buffer = BytesIO()
     doc = SimpleDocTemplate(buffer)
     elements = []
-
     style = getSampleStyleSheet()
     elements.append(Paragraph("Studio Rent Overview", style["Heading1"]))
     elements.append(Spacer(1, 12))
-
     data = [list(df.columns)] + df.values.tolist()
     table = Table(data)
     table.setStyle([
         ("BACKGROUND", (0, 0), (-1, 0), colors.grey),
         ("GRID", (0, 0), (-1, -1), 0.5, colors.black),
     ])
-
     elements.append(table)
     doc.build(elements)
     return buffer.getvalue()
