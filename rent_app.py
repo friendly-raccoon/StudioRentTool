@@ -114,7 +114,7 @@ if tenant_file and payment_file:
         allocated.to_excel(writer, index=False, sheet_name="Allocated Payments")
         unmatched.to_excel(writer, index=False, sheet_name="Unmatched Payments")
         def to_excel(allocated, unmatched):
-        output = BytesIO()
+    output = BytesIO()
     
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         allocated.to_excel(writer, index=False, sheet_name="Allocated Payments")
