@@ -69,7 +69,8 @@ if tenant_file and payment_file:
         amount = float(pay_row["Amount Paid"])
         
         # Fuzzy match artist
-        best_match, score = process.extractOne(payer_name, tenants_copy["Artist"])
+        artist_list = tenants_copy["Artist"].dropna().astype(str).tolist()
+        best_match, score = process.extractOne(str(payer_name), artist_list)
         
         if score >= threshold:
             idx = tenants_copy[tenants_copy["Artist"] == best_match].index[0]
