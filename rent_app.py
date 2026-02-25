@@ -47,7 +47,11 @@ if payment_file:
     
     payments = payments[[payer_col, amount_col, date_col]]
     payments.columns = ["Payer","Amount Paid","Payment Date"]
-    payments["Amount Paid"] = payments["Amount Paid"].astype(float)
+    # Ensure numeric
+    payments["Amount Paid"] = pd.to_numeric(payments["Amount Paid"], errors='coerce')
+
+    # Drop invalid or non-positive payments
+    payments = payments[payments["Amount Paid"].notna()]
     payments = payments[payments["Amount Paid"] > 0]  # incoming payments
     
     st.subheader("Payments")
